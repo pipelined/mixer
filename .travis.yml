@@ -1,0 +1,21 @@
+language: go
+go: 
+ - "1.11.x"
+
+os: osx
+
+install: true
+
+env:
+  global:
+    - GO111MODULE=on
+    - CODECOV_TOKEN="4577e6e0-0592-4dc3-a6b6-01fa26d5ef7e"
+
+before_install:
+  - brew update
+  - brew install portaudio 
+
+script: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
