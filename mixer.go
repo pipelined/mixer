@@ -74,7 +74,7 @@ func New() *Mixer {
 }
 
 // Sink registers new input. SampleRate and NumChannels are propagated here, due to that Sink pipes should be called before Pump.
-func (m *Mixer) Sink(inputID string, sampleRate, numChannel, bufferSize int) (func([][]float64) error, error) {
+func (m *Mixer) Sink(inputID string, sampleRate, numChannel int) (func([][]float64) error, error) {
 	m.m.Lock()
 	m.sampleRate = sampleRate
 	m.numChannels = numChannel
@@ -114,13 +114,13 @@ func (m *Mixer) isOutput(sourceID string) bool {
 }
 
 // Pump returns a pump function which allows to read the out channel.
-func (m *Mixer) Pump(outputID string, bufferSize int) (func() ([][]float64, error), int, int, error) {
+func (m *Mixer) Pump(outputID string) (func(bufferSize int) ([][]float64, error), int, int, error) {
 	m.m.Lock()
 	sampleRate := m.sampleRate
 	numChannels := m.numChannels
 	m.m.Unlock()
 	m.outputID.Store(outputID)
-	return func() ([][]float64, error) {
+	return func(bufferSize int) ([][]float64, error) {
 		// receive new buffer
 		f, ok := <-m.out
 		if !ok {

@@ -18,7 +18,7 @@ type sinkConfig struct {
 	interrupt bool
 }
 
-func TestNewMixer(t *testing.T) {
+func TestMixer(t *testing.T) {
 	tests := []struct {
 		description string
 		numChannels int
@@ -86,19 +86,18 @@ func TestNewMixer(t *testing.T) {
 
 	var err error
 	for _, test := range tests {
-		t.Log(test.description)
 		numTracks := len(test.tracks)
 		pumpID := string(numTracks)
 		mixer := mixer.New()
 		// init sink funcs
 		sinks := make([]func([][]float64) error, numTracks)
 		for i := 0; i < numTracks; i++ {
-			sinks[i], err = mixer.Sink(string(i), test.sampleRate, test.numChannels, test.bufferSize)
+			sinks[i], err = mixer.Sink(string(i), test.sampleRate, test.numChannels)
 			assert.Nil(t, err)
 
 		}
 		// init pump func
-		pump, _, _, err := mixer.Pump(pumpID, test.bufferSize)
+		pump, _, _, err := mixer.Pump(pumpID)
 		assert.Nil(t, err)
 
 		// reset sinks
@@ -139,7 +138,7 @@ func TestNewMixer(t *testing.T) {
 					i++
 				}
 			}
-			buffer, err = pump()
+			buffer, err = pump(test.bufferSize)
 			if buffer != nil {
 				result = result.Append(buffer)
 				assert.Nil(t, err)
@@ -179,8 +178,4 @@ func buf(numChannels, size int, value float64) [][]float64 {
 		}
 	}
 	return result
-}
-
-func TestNewMixerInterrupt(t *testing.T) {
-
 }
