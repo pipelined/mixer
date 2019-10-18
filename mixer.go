@@ -10,21 +10,14 @@ import (
 
 // Mixer summs up multiple channels of messages into a single channel.
 type Mixer struct {
-	out chan *frame // channel to send frames ready for mix
-	// in  chan *message // channel to send incoming messages
-
-	done []string // done inputs ids
-	// register chan string   // register new input input, buffered
-	outputID atomic.Value // id of the pipe which is output of mixer
-	// cancel   chan struct{} // cancel is closed only when pump is interrupted
-
-	active int32 // number of active inputs
-
-	// m           sync.Mutex
-	inputs      map[string]*input // inputs
-	frame       *frame            // last processed frame
 	sampleRate  signal.SampleRate
 	numChannels int
+	inputs      map[string]*input // inputs
+	output      chan *frame       // channel to send frames ready for mix
+	outputID    atomic.Value      // id of the pipe which is output of mixer
+
+	active     int32  // number of active inputs
+	firstFrame *frame // first frame, used only to initialize inputs.
 }
 
 type message struct {
@@ -79,7 +72,7 @@ func (f *frame) add(b signal.Float64) bool {
 		}
 	}
 	f.summed++
-	return f.expected == f.summed
+	return f.isComplete()
 }
 
 const (
@@ -89,14 +82,9 @@ const (
 // New returns new mixer.
 func New(numChannels int) *Mixer {
 	m := Mixer{
-		frame: &frame{
-			buffer: make([][]float64, numChannels),
-		},
+		firstFrame:  newFrame(0, numChannels),
 		inputs:      make(map[string]*input),
 		numChannels: numChannels,
-		// in:     make(chan *message, 1),
-		// register: make(chan string, maxInputs),
-		// cancel: make(chan struct{}),
 	}
 	return &m
 }
@@ -104,13 +92,11 @@ func New(numChannels int) *Mixer {
 // Sink registers new input. All inputs should have same number of channels.
 // If different number of channels is provided, error will be returned.
 func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels int) (func(signal.Float64) error, error) {
-	// m.m.Lock() // WRITE
-	// defer m.m.Unlock()
 	m.sampleRate = sampleRate
-	m.frame.expected++
+	m.firstFrame.expected++
 	in := input{
 		id:          inputID,
-		frame:       m.frame,
+		frame:       m.firstFrame,
 		numChannels: numChannels,
 	}
 	// add new input.
@@ -125,9 +111,9 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 		}
 		in.frame.Unlock()
 
-		// send if done
+		// send if done.
 		if done {
-			m.out <- in.frame
+			m.output <- in.frame
 		}
 
 		in.frame = in.frame.next
@@ -138,7 +124,8 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 // Reset resets the mixer for another run.
 func (m *Mixer) Reset(sourceID string) error {
 	if m.isOutput(sourceID) {
-		m.out = make(chan *frame, 1)
+		m.output = make(chan *frame, 1)
+		m.firstFrame = newFrame(int32(len(m.inputs)), m.numChannels)
 	} else {
 		atomic.AddInt32(&m.active, 1)
 	}
@@ -148,11 +135,26 @@ func (m *Mixer) Reset(sourceID string) error {
 // Flush mixer data for defined source.
 func (m *Mixer) Flush(sourceID string) error {
 	if !m.isOutput(sourceID) {
+		// remove input from actives.
 		active := atomic.AddInt32(&m.active, -1)
+
+		// reset expectations for remaining frames.
 		in := m.inputs[sourceID]
-		resetExpectations(m.out, in.frame, active)
+		for in.frame != nil {
+			in.frame.Lock()
+			in.frame.expected = int(active)
+			in.frame.Unlock()
+
+			// send if complete.
+			if in.frame.isComplete() {
+				m.output <- in.frame
+			}
+
+			// move to the next.
+			in.frame = in.frame.next
+		}
 		if active == 0 {
-			close(m.out)
+			close(m.output)
 		}
 	}
 	return nil
@@ -168,11 +170,10 @@ func (m *Mixer) Pump(outputID string) (func(signal.Float64) error, signal.Sample
 	m.outputID.Store(outputID)
 	return func(b signal.Float64) error {
 		// receive new buffer
-		f, ok := <-m.out
+		f, ok := <-m.output
 		if !ok {
 			return io.EOF
 		}
-		m.frame = f
 		f.copySum(b)
 		return nil
 	}, m.sampleRate, numChannels, nil
@@ -188,18 +189,5 @@ func newFrame(numInputs int32, numChannels int) *frame {
 	return &frame{
 		expected: int(numInputs),
 		buffer:   make([][]float64, numChannels),
-	}
-}
-
-// resetExpectations for all frames after this one.
-func resetExpectations(out chan *frame, f *frame, e int32) {
-	for f != nil {
-		f.Lock()
-		f.expected = int(e)
-		f.Unlock()
-		if f.expected == f.summed && f.expected > 0 {
-			out <- f
-		}
-		f = f.next
 	}
 }
