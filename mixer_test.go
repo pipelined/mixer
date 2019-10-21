@@ -4,116 +4,98 @@ import (
 	"io"
 	"testing"
 
-	"go.uber.org/goleak"
-
 	"github.com/stretchr/testify/assert"
 
 	"github.com/pipelined/mixer"
 	"github.com/pipelined/signal"
 )
 
-type sinkConfig struct {
-	messages  int
-	value     float64
-	interrupt bool
-}
+// type track struct {
+// 	messages  int
+// 	value     float64
+// 	interrupt bool
+// }
 
 func TestMixer(t *testing.T) {
+	const numTracks = 2
 	tests := []struct {
 		description string
-		numChannels int
-		bufferSize  int
-		sampleRate  signal.SampleRate
-		tracks      []sinkConfig
+		messages    [numTracks]int
+		values      [numTracks]float64
 		expected    [][]float64
 	}{
 		{
-			description: "regular test",
-			numChannels: 1,
-			bufferSize:  2,
-			sampleRate:  44100,
-			tracks: []sinkConfig{
-				{
-					messages: 4,
-					value:    0.7,
-				},
-				{
-					messages: 3,
-					value:    0.5,
-				},
+			description: "1st run",
+			messages: [numTracks]int{
+				4,
+				3,
+			},
+			values: [numTracks]float64{
+				0.7,
+				0.5,
 			},
 			expected: [][]float64{{0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 0.7}},
 		},
 		{
-			description: "sink interrupt",
-			numChannels: 1,
-			bufferSize:  2,
-			sampleRate:  44100,
-			tracks: []sinkConfig{
-				{
-					messages: 4,
-					value:    0.7,
-				},
-				{
-					interrupt: true,
-					messages:  5,
-					value:     0.5,
-				},
+			description: "2nd run",
+			messages: [numTracks]int{
+				5,
+				4,
+			},
+			values: [numTracks]float64{
+				0.5,
+				0.7,
 			},
 			expected: [][]float64{{0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.5, 0.5}},
 		},
 	}
 
-	var err error
-	for _, test := range tests {
-		numTracks := len(test.tracks)
-		pumpID := string(numTracks)
-		mixer := mixer.New(test.numChannels)
-		// init sink funcs
-		sinks := make([]func(signal.Float64) error, numTracks)
-		for i := 0; i < numTracks; i++ {
-			sinks[i], err = mixer.Sink(string(i), test.sampleRate, test.numChannels)
-			assert.Nil(t, err)
+	var (
+		err         error
+		sampleRate  = signal.SampleRate(44100)
+		numChannels = 1
+		bufferSize  = 2
+		pumpID      = string("pumpID")
+	)
 
-		}
-		// init pump func
-		pump, _, _, err := mixer.Pump(pumpID)
+	mixer := mixer.New(numChannels)
+
+	// init sink funcs
+	sinks := make([]func(signal.Float64) error, numTracks)
+	for i := 0; i < numTracks; i++ {
+		sinks[i], err = mixer.Sink(string(i), sampleRate, numChannels)
 		assert.Nil(t, err)
+	}
+	// init pump func
+	pump, _, _, err := mixer.Pump(pumpID)
+	assert.Nil(t, err)
 
-		// reset sinks
+	for _, test := range tests {
+		// reset all
 		for i := 0; i < numTracks; i++ {
 			err = mixer.Reset(string(i))
 			assert.Nil(t, err)
 		}
-
-		// reset pump
-		err = mixer.Reset(string(pumpID))
+		err = mixer.Reset(pumpID)
 		assert.Nil(t, err)
 
 		// mixing cycle
-		result := signal.Float64(make([][]float64, test.numChannels))
-		var buffer [][]float64
-		sent := 0
-		for len(sinks) > 0 {
-			i := 0
-			for i < len(sinks) {
-				// check if track is done
-				if test.tracks[i].messages == sent {
-					err = mixer.Flush(string(i))
-					if err != nil {
-						assert.Equal(t, io.ErrClosedPipe, err)
-					}
+		result := signal.Float64(make([][]float64, numChannels))
 
-					sinks = append(sinks[:i], sinks[i+1:]...)
-					test.tracks = append(test.tracks[:i], test.tracks[i+1:]...)
-				} else {
-					buf := buf(test.numChannels, test.bufferSize, test.tracks[i].value)
+		var sent = 0
+		for {
+			for i := 0; i < numTracks; i++ {
+				// check if track is done
+				if test.messages[i] == sent {
+					err = mixer.Flush(string(i))
+					assert.NoError(t, err)
+				} else if test.messages[i] > sent {
+					buf := buf(numChannels, bufferSize, test.values[i])
 					err = sinks[i](buf)
-					assert.Nil(t, err)
-					i++
+					assert.NoError(t, err)
 				}
 			}
-			buffer = signal.Float64Buffer(test.numChannels, test.bufferSize)
+			buffer := signal.Float64Buffer(numChannels, bufferSize)
 			err = pump(buffer)
 			if err != nil {
 				assert.Equal(t, io.EOF, err)
@@ -121,13 +103,12 @@ func TestMixer(t *testing.T) {
 			}
 			if buffer != nil {
 				result = result.Append(buffer)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			}
 			sent++
 		}
 		err = mixer.Flush(pumpID)
-		assert.Nil(t, err)
-		goleak.VerifyNoLeaks(t)
+		assert.NoError(t, err)
 
 		assert.Equal(t, len(test.expected), result.NumChannels(), "Incorrect result num channels")
 		for i := range test.expected {

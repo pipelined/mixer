@@ -97,7 +97,6 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 	m.firstFrame.expected++
 	in := input{
 		id:          inputID,
-		frame:       m.firstFrame,
 		numChannels: numChannels,
 	}
 	// add new input.
@@ -128,7 +127,11 @@ func (m *Mixer) Reset(sourceID string) error {
 		m.output = make(chan *frame, 1)
 		m.firstFrame = newFrame(int32(len(m.inputs)), m.numChannels)
 	} else {
+		m.m.Lock()
+		defer m.m.Unlock()
 		atomic.AddInt32(&m.activeInputs, 1)
+		in := m.inputs[sourceID]
+		in.frame = m.firstFrame
 	}
 	return nil
 }
