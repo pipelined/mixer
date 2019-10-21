@@ -13,11 +13,10 @@ type Mixer struct {
 	sampleRate  signal.SampleRate
 	numChannels int
 
-	active   int32             // number of active inputs
-	inputs   map[string]*input // inputs
-	outputID atomic.Value      // id of the pipe which is output of mixer
-
-	firstFrame *frame // first frame, used only to initialize inputs
+	inputs       map[string]*input // inputs
+	activeInputs int32             // number of activeInputs inputs
+	firstFrame   *frame            // first frame, used only to initialize inputs
+	outputID     atomic.Value      // id of the pipe which is output of mixer
 
 	m      sync.Mutex  // mutex is needed to synchronize flushing
 	output chan *frame // channel to send frames ready for mix
@@ -109,7 +108,7 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 		done := in.frame.add(b)
 		// move input to the next frame.
 		if in.frame.next == nil {
-			in.frame.next = newFrame(atomic.LoadInt32(&m.active), m.numChannels)
+			in.frame.next = newFrame(atomic.LoadInt32(&m.activeInputs), m.numChannels)
 		}
 		in.frame.Unlock()
 
@@ -129,7 +128,7 @@ func (m *Mixer) Reset(sourceID string) error {
 		m.output = make(chan *frame, 1)
 		m.firstFrame = newFrame(int32(len(m.inputs)), m.numChannels)
 	} else {
-		atomic.AddInt32(&m.active, 1)
+		atomic.AddInt32(&m.activeInputs, 1)
 	}
 	return nil
 }
@@ -143,13 +142,13 @@ func (m *Mixer) Flush(sourceID string) error {
 	m.m.Lock()
 	defer m.m.Unlock()
 	// remove input from actives.
-	active := atomic.AddInt32(&m.active, -1)
+	activeInputs := atomic.AddInt32(&m.activeInputs, -1)
 
 	// reset expectations for remaining frames.
 	in := m.inputs[sourceID]
 	for in.frame != nil {
 		in.frame.Lock()
-		in.frame.expected = int(active)
+		in.frame.expected = int(activeInputs)
 		in.frame.Unlock()
 
 		// send if complete.
@@ -160,7 +159,7 @@ func (m *Mixer) Flush(sourceID string) error {
 		// move to the next.
 		in.frame = in.frame.next
 	}
-	if active == 0 {
+	if activeInputs == 0 {
 		close(m.output)
 	}
 	return nil
