@@ -12,12 +12,15 @@ import (
 type Mixer struct {
 	sampleRate  signal.SampleRate
 	numChannels int
-	inputs      map[string]*input // inputs
-	output      chan *frame       // channel to send frames ready for mix
-	outputID    atomic.Value      // id of the pipe which is output of mixer
 
-	active     int32  // number of active inputs
-	firstFrame *frame // first frame, used only to initialize inputs.
+	active   int32             // number of active inputs
+	inputs   map[string]*input // inputs
+	outputID atomic.Value      // id of the pipe which is output of mixer
+
+	firstFrame *frame // first frame, used only to initialize inputs
+
+	m      sync.Mutex  // mutex is needed to synchronize flushing
+	output chan *frame // channel to send frames ready for mix
 }
 
 type message struct {
@@ -43,12 +46,11 @@ type frame struct {
 // sum returns mixed samplein.
 func (f *frame) copySum(b signal.Float64) {
 	// shrink result buffer if needed.
-	if f.buffer.Size() > b.Size() {
+	if b.Size() > f.buffer.Size() {
 		for i := range f.buffer {
 			b[i] = b[i][:f.buffer.Size()]
 		}
 	}
-
 	// copy summed data.
 	for i := 0; i < b.NumChannels(); i++ {
 		for j := 0; j < b.Size(); j++ {
@@ -134,28 +136,32 @@ func (m *Mixer) Reset(sourceID string) error {
 
 // Flush mixer data for defined source.
 func (m *Mixer) Flush(sourceID string) error {
-	if !m.isOutput(sourceID) {
-		// remove input from actives.
-		active := atomic.AddInt32(&m.active, -1)
+	if m.isOutput(sourceID) {
+		return nil
+	}
 
-		// reset expectations for remaining frames.
-		in := m.inputs[sourceID]
-		for in.frame != nil {
-			in.frame.Lock()
-			in.frame.expected = int(active)
-			in.frame.Unlock()
+	m.m.Lock()
+	defer m.m.Unlock()
+	// remove input from actives.
+	active := atomic.AddInt32(&m.active, -1)
 
-			// send if complete.
-			if in.frame.isComplete() {
-				m.output <- in.frame
-			}
+	// reset expectations for remaining frames.
+	in := m.inputs[sourceID]
+	for in.frame != nil {
+		in.frame.Lock()
+		in.frame.expected = int(active)
+		in.frame.Unlock()
 
-			// move to the next.
-			in.frame = in.frame.next
+		// send if complete.
+		if in.frame.isComplete() {
+			m.output <- in.frame
 		}
-		if active == 0 {
-			close(m.output)
-		}
+
+		// move to the next.
+		in.frame = in.frame.next
+	}
+	if active == 0 {
+		close(m.output)
 	}
 	return nil
 }
