@@ -1,6 +1,7 @@
 package mixer_test
 
 import (
+	"fmt"
 	"io"
 	"testing"
 
@@ -36,22 +37,21 @@ func TestMixer(t *testing.T) {
 			},
 			expected: [][]float64{{0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 0.7}},
 		},
-		{
-			description: "2nd run",
-			messages: [numTracks]int{
-				5,
-				4,
-			},
-			values: [numTracks]float64{
-				0.5,
-				0.7,
-			},
-			expected: [][]float64{{0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.5, 0.5}},
-		},
+		// {
+		// 	description: "2nd run",
+		// 	messages: [numTracks]int{
+		// 		5,
+		// 		4,
+		// 	},
+		// 	values: [numTracks]float64{
+		// 		0.5,
+		// 		0.7,
+		// 	},
+		// 	expected: [][]float64{{0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.5, 0.5}},
+		// },
 	}
 
 	var (
-		err         error
 		sampleRate  = signal.SampleRate(44100)
 		numChannels = 1
 		bufferSize  = 2
@@ -63,6 +63,7 @@ func TestMixer(t *testing.T) {
 	// init sink funcs
 	sinks := make([]func(signal.Float64) error, numTracks)
 	for i := 0; i < numTracks; i++ {
+		var err error
 		sinks[i], err = mixer.Sink(string(i), sampleRate, numChannels)
 		assert.Nil(t, err)
 	}
@@ -71,44 +72,36 @@ func TestMixer(t *testing.T) {
 	assert.Nil(t, err)
 
 	for _, test := range tests {
-		// reset all
-		for i := 0; i < numTracks; i++ {
-			err = mixer.Reset(string(i))
-			assert.Nil(t, err)
-		}
-		err = mixer.Reset(pumpID)
-		assert.Nil(t, err)
-
-		// mixing cycle
 		result := signal.Float64(make([][]float64, numChannels))
-
-		var sent = 0
-		for {
-			for i := 0; i < numTracks; i++ {
-				// check if track is done
-				if test.messages[i] == sent {
-					err = mixer.Flush(string(i))
-					assert.NoError(t, err)
-				} else if test.messages[i] > sent {
-					buf := buf(numChannels, bufferSize, test.values[i])
-					err = sinks[i](buf)
+		// mixing cycle
+		for i := 0; i < numTracks; i++ {
+			go func(i int, messages int, value float64, sinkFn func(signal.Float64) error) {
+				// err := mixer.Reset(string(i))
+				// assert.Nil(t, err)
+				for i := 0; i < messages; i++ {
+					buf := buf(numChannels, bufferSize, value)
+					err := sinkFn(buf)
 					assert.NoError(t, err)
 				}
-			}
+				err := mixer.Flush(string(i))
+				assert.NoError(t, err)
+			}(i, test.messages[i], test.values[i], sinks[i])
+		}
+		// err = mixer.Reset(pumpID)
+		// assert.Nil(t, err)
+		for {
 			buffer := signal.Float64Buffer(numChannels, bufferSize)
-			err = pump(buffer)
-			if err != nil {
+			if err := pump(buffer); err != nil {
 				assert.Equal(t, io.EOF, err)
 				break
 			}
 			if buffer != nil {
 				result = result.Append(buffer)
-				assert.NoError(t, err)
 			}
-			sent++
 		}
 		err = mixer.Flush(pumpID)
 		assert.NoError(t, err)
+		fmt.Printf("%+v", result)
 
 		assert.Equal(t, len(test.expected), result.NumChannels(), "Incorrect result num channels")
 		for i := range test.expected {
