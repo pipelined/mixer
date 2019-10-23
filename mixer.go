@@ -89,13 +89,18 @@ const (
 // New returns new mixer.
 func New(numChannels int) *Mixer {
 	m := Mixer{
-		firstFrame:  newFrame(0, numChannels),
 		inputs:      make(map[string]*input),
 		numChannels: numChannels,
-		output:      make(chan *frame),
-		done:        make(chan struct{}),
 	}
+	m.reset()
 	return &m
+}
+
+// reset structures required for new run.
+func (m *Mixer) reset() {
+	m.output = make(chan *frame)
+	m.done = make(chan struct{})
+	m.firstFrame = newFrame(len(m.inputs), m.numChannels)
 }
 
 // Sink registers new input. All inputs should have same number of channels.
@@ -111,23 +116,26 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 	// add new input.
 	m.inputs[inputID] = &in
 	m.activeInputs++
-
+	var (
+		done    bool
+		current *frame
+	)
 	return func(b signal.Float64) error {
-		in.frame.Lock()
-		in.frame.add(b)
-		complete := in.frame.isComplete()
+		current = in.frame
+		current.Lock()
+		current.add(b)
+		done = current.done()
 		// move input to the next frame.
-		if in.frame.next == nil {
-			in.frame.next = newFrame(in.frame.expected, m.numChannels)
+		if current.next == nil {
+			current.next = newFrame(current.expected, m.numChannels)
 		}
-		in.frame.Unlock()
+		current.Unlock()
+		in.frame = current.next
 
 		// send if done.
-		if complete {
-			m.output <- in.frame
+		if done {
+			m.output <- current
 		}
-
-		in.frame = in.frame.next
 		return nil
 	}, nil
 }
@@ -162,33 +170,33 @@ func (m *Mixer) Flush(sourceID string) error {
 
 	// flush pump.
 	if m.isOutput(sourceID) {
-		m.output = make(chan *frame)
-		m.done = make(chan struct{})
-		m.firstFrame = newFrame(len(m.inputs), m.numChannels)
+		m.reset()
 		for _, in := range m.inputs {
 			in.frame = m.firstFrame
 		}
 		return nil
 	}
 
-	// remove input from actives.
+	var (
+		done    bool
+		current *frame
+		in      = m.inputs[sourceID]
+	)
 	// reset expectations for remaining frames.
-	in := m.inputs[sourceID]
-
 	for in.frame != nil {
-		// new var for send.
-		f := in.frame
-		f.Lock()
-		f.expected--
-		in.frame = f.next
-		complete := f.isComplete()
-		f.Unlock()
+		current = in.frame
+		current.Lock()
+		current.expected--
+		done = current.done()
+		in.frame = current.next
+		current.Unlock()
 
-		// send if complete.
-		if complete {
-			m.output <- f
+		// send if done.
+		if done {
+			m.output <- current
 		}
 	}
+	// remove input from actives.
 	m.activeInputs--
 	if m.activeInputs == 0 {
 		close(m.done)
@@ -201,7 +209,7 @@ func (m *Mixer) isOutput(sourceID string) bool {
 }
 
 // isReady checks if frame is completed.
-func (f *frame) isComplete() bool {
+func (f *frame) done() bool {
 	return f.expected > 0 && f.expected == f.summed
 }
 
