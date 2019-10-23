@@ -1,7 +1,6 @@
 package mixer_test
 
 import (
-	"fmt"
 	"io"
 	"testing"
 
@@ -101,12 +100,12 @@ func TestMixer(t *testing.T) {
 		}
 		err = mixer.Flush(pumpID)
 		assert.NoError(t, err)
-		fmt.Printf("%+v", result)
+		// fmt.Printf("%+v", result)
 
 		assert.Equal(t, len(test.expected), result.NumChannels(), "Incorrect result num channels")
 		for i := range test.expected {
 			assert.Equal(t, len(test.expected[i]), len(result[i]), "Incorrect result channel length")
-			for j, val := range test.expected[i] {
+			for j, val := range result[i] {
 				assert.Equal(t, val, result[i][j])
 			}
 		}

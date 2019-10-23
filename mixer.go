@@ -1,7 +1,6 @@
 package mixer
 
 import (
-	"fmt"
 	"io"
 	"sync"
 
@@ -13,8 +12,10 @@ type Mixer struct {
 	sampleRate  signal.SampleRate
 	numChannels int
 
-	// channel to send frames ready for mix
+	// frames ready for mix
 	output chan *frame
+	// signal that all sinks are done
+	done chan struct{}
 
 	// mutex is needed to synchronize access to the mixer
 	m sync.Mutex
@@ -64,7 +65,7 @@ func (f *frame) copySum(b signal.Float64) {
 	}
 }
 
-func (f *frame) add(b signal.Float64) bool {
+func (f *frame) add(b signal.Float64) {
 	// expand frame buffer if needed.
 	if diff := b.Size() - f.buffer.Size(); diff > 0 {
 		for i := range f.buffer {
@@ -79,7 +80,6 @@ func (f *frame) add(b signal.Float64) bool {
 		}
 	}
 	f.summed++
-	return f.isComplete()
 }
 
 const (
@@ -93,6 +93,7 @@ func New(numChannels int) *Mixer {
 		inputs:      make(map[string]*input),
 		numChannels: numChannels,
 		output:      make(chan *frame),
+		done:        make(chan struct{}),
 	}
 	return &m
 }
@@ -113,16 +114,16 @@ func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels i
 
 	return func(b signal.Float64) error {
 		in.frame.Lock()
-		done := in.frame.add(b)
+		in.frame.add(b)
+		complete := in.frame.isComplete()
 		// move input to the next frame.
 		if in.frame.next == nil {
-			in.frame.next = newFrame(m.activeInputs, m.numChannels)
+			in.frame.next = newFrame(in.frame.expected, m.numChannels)
 		}
-		fmt.Printf("")
 		in.frame.Unlock()
 
 		// send if done.
-		if done {
+		if complete {
 			m.output <- in.frame
 		}
 
@@ -136,22 +137,33 @@ func (m *Mixer) Pump(outputID string) (func(signal.Float64) error, signal.Sample
 	numChannels := m.numChannels
 	m.outputID = outputID
 	return func(b signal.Float64) error {
-		// receive new buffer
-		f, ok := <-m.output
-		if !ok {
-			return io.EOF
+		select {
+		case f := <-m.output: // receive new frame.
+			f.copySum(b)
+			return nil
+		case <-m.done: // recieve done signal.
+			select {
+			case f := <-m.output: // try to receive flushed frames.
+				f.copySum(b)
+				return nil
+			default:
+				return io.EOF
+			}
 		}
-		f.copySum(b)
-		return nil
+
 	}, m.sampleRate, numChannels, nil
 }
 
 // Flush mixer data for defined source.
+// All Flush calls are synchronized. It doesn't affect Sink/Pump goroutines.
 func (m *Mixer) Flush(sourceID string) error {
 	m.m.Lock()
 	defer m.m.Unlock()
+
+	// flush pump.
 	if m.isOutput(sourceID) {
 		m.output = make(chan *frame)
+		m.done = make(chan struct{})
 		m.firstFrame = newFrame(len(m.inputs), m.numChannels)
 		for _, in := range m.inputs {
 			in.frame = m.firstFrame
@@ -160,25 +172,26 @@ func (m *Mixer) Flush(sourceID string) error {
 	}
 
 	// remove input from actives.
-	m.activeInputs--
-	fmt.Printf("Flush: %s Active inputs: %d\n", sourceID, m.activeInputs)
 	// reset expectations for remaining frames.
 	in := m.inputs[sourceID]
+
 	for in.frame != nil {
-		in.frame.Lock()
-		in.frame.expected = int(m.activeInputs)
-		in.frame.Unlock()
+		// new var for send.
+		f := in.frame
+		f.Lock()
+		f.expected--
+		in.frame = f.next
+		complete := f.isComplete()
+		f.Unlock()
 
 		// send if complete.
-		if in.frame.isComplete() {
-			m.output <- in.frame
+		if complete {
+			m.output <- f
 		}
-		fmt.Printf("Flushing frame: %+v\n", in.frame)
-		// move to the next.
-		in.frame = in.frame.next
 	}
+	m.activeInputs--
 	if m.activeInputs == 0 {
-		close(m.output)
+		close(m.done)
 	}
 	return nil
 }
