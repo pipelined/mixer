@@ -3,7 +3,6 @@ package mixer
 import (
 	"context"
 	"io"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -21,8 +20,6 @@ type Mixer struct {
 	// signal that all sinks are done
 	done chan struct{}
 
-	// mutex is needed to synchronize access to the mixer
-	m sync.Mutex
 	// totalInputs int
 	// number of active inputs, used to shutdown mixer
 	activeInputs int32
