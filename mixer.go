@@ -1,10 +1,14 @@
 package mixer
 
 import (
+	"context"
 	"io"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 
-	"github.com/pipelined/signal"
+	"pipelined.dev/pipe"
+	"pipelined.dev/signal"
 )
 
 // Mixer summs up multiple channels of messages into a single channel.
@@ -19,204 +23,184 @@ type Mixer struct {
 
 	// mutex is needed to synchronize access to the mixer
 	m sync.Mutex
-	// inputs
-	inputs map[string]*input
-	// number of active inputs, used to fill the frames
-	activeInputs int
-	// first frame, used to initialize inputs
-	firstFrame *frame
-	// id of the pipe which is output of mixer
-	outputID string
-}
-
-type message struct {
-	inputID string
-	buffer  signal.Float64
-}
-
-type input struct {
-	id          string
-	numChannels int
-	frame       *frame
+	// totalInputs int
+	// number of active inputs, used to shutdown mixer
+	activeInputs int32
+	// last frame, used to initialize inputs
+	tail atomic.Value
 }
 
 // frame represents a slice of samples to mix.
 type frame struct {
-	sync.Mutex
-	buffer   signal.Float64
-	summed   int
-	expected int
-	next     *frame
+	buffer   unsafe.Pointer
+	added    int32
+	expected int32
+	next     unsafe.Pointer
 }
 
 // sum returns mixed samplein.
-func (f *frame) copySum(b signal.Float64) {
-	// shrink result buffer if needed.
-	if b.Size() > f.buffer.Size() {
-		for i := range f.buffer {
-			b[i] = b[i][:f.buffer.Size()]
+func (f *frame) sum(out signal.Floating) {
+	summs := f.loadBuffer()
+	offset := out.Len()
+	for i := 0; i < out.Len(); i++ {
+		var sum float64
+		for j := 0; j < int(f.added); j++ {
+			sum += summs.Sample(i + j*offset)
 		}
-	}
-	// copy summed data.
-	for i := 0; i < b.NumChannels(); i++ {
-		for j := 0; j < b.Size(); j++ {
-			b[i][j] = f.buffer[i][j] / float64(f.summed)
-		}
+		out.SetSample(i, sum/float64(f.added))
 	}
 }
 
-func (f *frame) add(b signal.Float64) {
-	// expand frame buffer if needed.
-	if diff := b.Size() - f.buffer.Size(); diff > 0 {
-		for i := range f.buffer {
-			f.buffer[i] = append(f.buffer[i], make([]float64, diff)...)
-		}
-	}
-
+// offset is the offset in the sums buffer
+func add(offset int, summs, floats signal.Floating) {
 	// copy summed data.
-	for i := 0; i < b.NumChannels(); i++ {
-		for j := 0; j < b.Size(); j++ {
-			f.buffer[i][j] += b[i][j]
-		}
+	for i := 0; i < floats.Len(); i++ {
+		summs.SetSample(offset+i, floats.Sample(i))
 	}
-	f.summed++
 }
-
-const (
-	maxInputs = 1024
-)
 
 // New returns new mixer.
 func New(numChannels int) *Mixer {
 	m := Mixer{
-		inputs:      make(map[string]*input),
 		numChannels: numChannels,
+		output:      make(chan *frame),
+		done:        make(chan struct{}),
 	}
-	m.reset()
+	m.storeTail(&frame{})
 	return &m
 }
 
-// reset structures required for new run.
-func (m *Mixer) reset() {
-	m.output = make(chan *frame)
-	m.done = make(chan struct{})
-	m.firstFrame = newFrame(len(m.inputs), m.numChannels)
+func (m *Mixer) Source() pipe.SourceAllocatorFunc {
+	return func(bufferSize int) (pipe.Source, pipe.SignalProperties, error) {
+		return pipe.Source{
+				SourceFunc: func(floats signal.Floating) (int, error) {
+					select {
+					case f := <-m.output: // receive new frame.
+						f.sum(floats)
+					case <-m.done: // recieve done signal.
+						select {
+						case f := <-m.output: // try to receive flushed frames.
+							f.sum(floats)
+						default:
+							return 0, io.EOF
+						}
+					}
+					return bufferSize, nil
+				},
+				FlushFunc: func(context.Context) error {
+					m.output = make(chan *frame)
+					m.done = make(chan struct{})
+					return nil
+				},
+			}, pipe.SignalProperties{
+				Channels:   m.numChannels,
+				SampleRate: m.sampleRate,
+			}, nil
+	}
 }
 
-// Sink registers new input. All inputs should have same number of channels.
-// If different number of channels is provided, error will be returned.
-func (m *Mixer) Sink(inputID string, sampleRate signal.SampleRate, numChannels int) (func(signal.Float64) error, error) {
-	m.sampleRate = sampleRate
-	m.firstFrame.expected++
-	in := input{
-		id:          inputID,
-		frame:       m.firstFrame,
-		numChannels: numChannels,
-	}
-	// add new input.
-	m.inputs[inputID] = &in
-	m.activeInputs++
-	var (
-		done    bool
-		current *frame
-	)
-	return func(b signal.Float64) error {
-		current = in.frame
-		current.Lock()
-		current.add(b)
-		done = current.done()
-		// move input to the next frame.
-		if current.next == nil {
-			current.next = newFrame(current.expected, m.numChannels)
-		}
-		current.Unlock()
-		in.frame = current.next
-
-		// send if done.
-		if done {
-			m.output <- current
-		}
-		return nil
-	}, nil
+func (m *Mixer) storeTail(f *frame) {
+	m.tail.Store(f)
 }
 
-// Pump returns a pump function which allows to read the out channel.
-func (m *Mixer) Pump(outputID string) (func(signal.Float64) error, signal.SampleRate, int, error) {
-	numChannels := m.numChannels
-	m.outputID = outputID
-	return func(b signal.Float64) error {
-		select {
-		case f := <-m.output: // receive new frame.
-			f.copySum(b)
-			return nil
-		case <-m.done: // recieve done signal.
-			select {
-			case f := <-m.output: // try to receive flushed frames.
-				f.copySum(b)
-				return nil
-			default:
-				return io.EOF
-			}
-		}
-
-	}, m.sampleRate, numChannels, nil
+func (m *Mixer) loadTail() *frame {
+	return m.tail.Load().(*frame)
 }
 
-// Flush mixer data for defined source.
-// All Flush calls are synchronized. It doesn't affect Sink/Pump goroutines.
-func (m *Mixer) Flush(sourceID string) error {
-	m.m.Lock()
-	defer m.m.Unlock()
+func (f *frame) storeBuffer(buf signal.Floating) bool {
+	return atomic.CompareAndSwapPointer(&f.buffer, nil, unsafe.Pointer(&buf))
+}
 
-	// flush pump.
-	if m.isOutput(sourceID) {
-		m.reset()
-		for _, in := range m.inputs {
-			in.frame = m.firstFrame
-		}
-		return nil
-	}
-
-	var (
-		done    bool
-		current *frame
-		in      = m.inputs[sourceID]
-	)
-	// reset expectations for remaining frames.
-	for in.frame != nil {
-		current = in.frame
-		current.Lock()
-		current.expected--
-		done = current.done()
-		in.frame = current.next
-		current.Unlock()
-
-		// send if done.
-		if done {
-			m.output <- current
-		}
-	}
-	// remove input from actives.
-	m.activeInputs--
-	if m.activeInputs == 0 {
-		close(m.done)
+func (f *frame) loadBuffer() signal.Floating {
+	if buf := atomic.LoadPointer(&f.buffer); buf != nil {
+		return *(*signal.Floating)(buf)
 	}
 	return nil
 }
 
-func (m *Mixer) isOutput(sourceID string) bool {
-	return sourceID == m.outputID
+func (f *frame) loadNext() *frame {
+	if next := atomic.LoadPointer(&f.next); next != nil {
+		return (*frame)(next)
+	}
+	return nil
+}
+
+func (m *Mixer) Sink() pipe.SinkAllocatorFunc {
+	return func(bufferSize int, props pipe.SignalProperties) (pipe.Sink, error) {
+		// TODO: handle different sample rates
+		m.sampleRate = props.SampleRate
+		m.activeInputs++
+		current := m.loadTail()
+		current.expected++ // THIS IS NOT THREADSAFE
+		return pipe.Sink{
+			SinkFunc: func(floats signal.Floating) error {
+				// sink new buffer
+				var buf signal.Floating
+				for {
+					// buffer was allocated by another goroutine
+					if buf = current.loadBuffer(); buf != nil {
+						break
+					}
+					expected := atomic.LoadInt32(&current.expected)
+					buf = signal.Allocator{
+						Channels: props.Channels,
+						Length:   bufferSize * props.Channels * int(expected),
+						Capacity: bufferSize * props.Channels * int(expected),
+					}.Float64()
+					// is store succeeds, this goroutine won the allocation race
+					if current.storeBuffer(buf) {
+						break
+					}
+				}
+				added := atomic.AddInt32(&current.added, 1)
+				offset := int(added-1) * bufferSize * props.Channels
+				add(offset, buf, floats)
+
+				// get the next frame
+				next := &frame{
+					expected: current.expected,
+				}
+				if atomic.CompareAndSwapPointer(&current.next, nil, unsafe.Pointer(next)) {
+					m.storeTail(next)
+				} else {
+					// other goroutine added next
+					next = current.loadNext()
+				}
+
+				if current.done(added) {
+					m.output <- current
+				}
+				current = next
+				return nil
+			},
+			FlushFunc: func(context.Context) error {
+				for current != nil {
+					next := current.loadNext()
+					atomic.AddInt32(&current.expected, -1)
+					if current.done(atomic.LoadInt32(&current.added)) {
+						m.output <- current
+					}
+					current = next
+				}
+				// remove input from actives.
+				if atomic.AddInt32(&m.activeInputs, -1) == 0 {
+					close(m.done)
+				}
+				return nil
+			},
+		}, nil
+	}
 }
 
 // isReady checks if frame is completed.
-func (f *frame) done() bool {
-	return f.expected > 0 && f.expected == f.summed
+func (f *frame) done(added int32) bool {
+	expected := atomic.LoadInt32(&f.expected)
+	return expected > 0 && expected == added
 }
 
-// newFrame generates new frame based on number of inputs.
-func newFrame(numInputs, numChannels int) *frame {
-	return &frame{
-		expected: numInputs,
-		buffer:   make([][]float64, numChannels),
+func min(n1, n2 int) int {
+	if n1 < n2 {
+		return n1
 	}
+	return n2
 }
