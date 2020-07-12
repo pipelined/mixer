@@ -60,9 +60,9 @@ func add(offset int, summs, floats signal.Floating) {
 }
 
 // New returns new mixer.
-func New(numChannels int) *Mixer {
+func New(channels int) *Mixer {
 	m := Mixer{
-		numChannels: numChannels,
+		numChannels: channels,
 		output:      make(chan *frame),
 		done:        make(chan struct{}),
 	}
@@ -70,6 +70,8 @@ func New(numChannels int) *Mixer {
 	return &m
 }
 
+// Source provides mixer source allocator. Mixer source outputs mixed
+// signal. Only single source per mixer is allowed.
 func (m *Mixer) Source() pipe.SourceAllocatorFunc {
 	return func(bufferSize int) (pipe.Source, pipe.SignalProperties, error) {
 		return pipe.Source{
@@ -125,13 +127,15 @@ func (f *frame) loadNext() *frame {
 	return nil
 }
 
+// Sink provides mixer sink allocator. Mixer sink receives a signal for
+// mixing. Multiple sinks per mixer is allowed.
 func (m *Mixer) Sink() pipe.SinkAllocatorFunc {
 	return func(bufferSize int, props pipe.SignalProperties) (pipe.Sink, error) {
 		// TODO: handle different sample rates
 		m.sampleRate = props.SampleRate
 		m.activeInputs++
 		current := m.loadTail()
-		current.expected++ // THIS IS NOT THREADSAFE
+		current.expected++
 		return pipe.Sink{
 			SinkFunc: func(floats signal.Floating) error {
 				// sink new buffer
