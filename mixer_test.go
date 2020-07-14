@@ -94,3 +94,48 @@ func assertEqual(t *testing.T, name string, result, expected interface{}) {
 		t.Fatalf("%v\nresult: \t%T\t%+v \nexpected: \t%T\t%+v", name, result, result, expected, expected)
 	}
 }
+
+func Test100Lines(t *testing.T) {
+	run(1, 512, 51200, 100)
+}
+
+func BenchmarkLimit(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		run(1, 512, i*2, 10)
+	}
+}
+
+func BenchmarkLines(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		run(1, 512, 51200, i+1)
+	}
+}
+
+func run(numChannels, bufferSize, limit, numLines int) {
+	mixer := mixer.New(numChannels)
+
+	var lines []pipe.Line
+	valueMultiplier := 1.0 / float64(numLines)
+	for i := 0; i < numLines; i++ {
+		sourceAllocator := mock.Source{
+			Channels: numChannels,
+			Limit:    limit,
+			Value:    float64(i) * valueMultiplier,
+		}
+		line, _ := pipe.Routing{
+			Source: sourceAllocator.Source(),
+			Sink:   mixer.Sink(),
+		}.Line(bufferSize)
+		lines = append(lines, line)
+	}
+	sink := mock.Sink{
+		Discard: true,
+	}
+	line, _ := pipe.Routing{
+		Source: mixer.Source(),
+		Sink:   sink.Sink(),
+	}.Line(bufferSize)
+	lines = append(lines, line)
+
+	pipe.New(context.Background(), pipe.WithLines(lines...)).Wait()
+}
