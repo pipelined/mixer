@@ -47,7 +47,7 @@ func TestMixer(t *testing.T) {
 					value:    0.7,
 				},
 			},
-			expected: []float64{0.6, 0.6, 0.6, 0.6, 0.5, 0},
+			expected: []float64{0.6, 0.6, 0.6, 0.6, 0.5},
 		},
 	}
 
