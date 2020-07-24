@@ -40,6 +40,7 @@ type frame struct {
 	expected int
 	added    int
 	flushed  int
+	length   int // https://github.com/pipelined/mixer/issues/5
 }
 
 type inputSignal struct {
@@ -49,28 +50,26 @@ type inputSignal struct {
 
 // sum returns mixed samplein.
 func (f *frame) sum() bool {
-	if f.added > 0 && f.added+f.flushed == f.expected {
-		for i := 0; i < f.buffer.Len(); i++ {
-			f.buffer.SetSample(i, f.buffer.Sample(i)/float64(f.added))
-		}
-		return true
+	if f.added == 0 || f.added+f.flushed != f.expected {
+		return false
 	}
-	return false
+	if f.buffer.Length() != f.length {
+		f.buffer = f.buffer.Slice(0, f.length)
+	}
+	for i := 0; i < f.length; i++ {
+		f.buffer.SetSample(i, f.buffer.Sample(i)/float64(f.added))
+	}
+	return true
 }
 
 func (f *frame) add(in signal.Floating) {
 	f.added++
-	length := min(f.buffer.Len(), in.Len())
-	for i := 0; i < length; i++ {
+	l := min(f.buffer.Len(), in.Len())
+	for i := 0; i < l; i++ {
 		f.buffer.SetSample(i, f.buffer.Sample(i)+in.Sample(i))
 	}
-	if f.buffer.Len() >= in.Len() {
-		return
-	}
-
-	// todo: fix allocations here
-	for i := length; i < in.Len(); i++ {
-		f.buffer = f.buffer.AppendSample(in.Sample(i))
+	if f.length < in.Length() {
+		f.length = in.Length()
 	}
 	return
 }
@@ -131,6 +130,7 @@ func (m *Mixer) Source() pipe.SourceAllocatorFunc {
 	return func(bufferSize int) (pipe.Source, pipe.SignalProperties, error) {
 		m.pool = signal.Allocator{
 			Channels: m.numChannels,
+			Length:   bufferSize, // https://github.com/pipelined/mixer/issues/5
 			Capacity: bufferSize,
 		}.Pool()
 		outputSignal := make(chan signal.Floating, 1)
@@ -175,7 +175,7 @@ func (m *Mixer) Sink() pipe.SinkAllocatorFunc {
 		return pipe.Sink{
 			SinkFunc: func(floats signal.Floating) error {
 				// sink new buffer
-				inputBuffer := m.pool.GetFloat64().Slice(0, floats.Length())
+				inputBuffer := m.pool.GetFloat64()
 				copied := signal.FloatingAsFloating(floats, inputBuffer)
 				if copied != inputBuffer.Length() {
 					inputBuffer = inputBuffer.Slice(0, copied)
