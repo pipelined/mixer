@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"pipelined.dev/pipe"
+	"pipelined.dev/pipe/pooling"
 	"pipelined.dev/signal"
 )
 
@@ -128,11 +129,11 @@ func New(channels int) *Mixer {
 // signal. Only single source per mixer is allowed.
 func (m *Mixer) Source() pipe.SourceAllocatorFunc {
 	return func(bufferSize int) (pipe.Source, pipe.SignalProperties, error) {
-		m.pool = signal.Allocator{
+		m.pool = pooling.Get(signal.Allocator{
 			Channels: m.numChannels,
 			Length:   bufferSize, // https://github.com/pipelined/mixer/issues/5
 			Capacity: bufferSize,
-		}.Pool()
+		})
 		outputSignal := make(chan signal.Floating, 1)
 		go mixer(m.pool, m.frames, m.inputSignal, outputSignal)
 
